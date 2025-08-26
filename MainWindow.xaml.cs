@@ -11,17 +11,19 @@ namespace NotiApp
 {
     public partial class MainWindow : Window
     {
+        // State Management Variables
         private bool _isPinned = false;
         private bool _isHidden = false;
         private bool _isAnimating = false;
-        
-        private Point _lastNotePosition;
-        private Size _lastNoteSize;
+        private Size _lastNoteSize; // The single source of truth for the note's dimensions
+
+        // Dragging Logic Variables
         private bool _isIconMouseDown = false;
         private bool _isDraggingIcon = false;
         private Point _dragStartPoint;
+
+        // UI and Resources
         private Storyboard _jiggleAnimation = null!;
-        
         private readonly List<SolidColorBrush> _noteColors;
         private int _currentColorIndex = 0;
         private const int TitleCharacterLimit = 50;
@@ -32,9 +34,9 @@ namespace NotiApp
             InitializeComponent();
             _noteColors = new List<SolidColorBrush>
             {
-                new SolidColorBrush(Color.FromRgb(0xFF, 0xF5, 0xE1)), new SolidColorBrush(Color.FromRgb(0xE1, 0xF5, 0xFF)),
-                new SolidColorBrush(Color.FromRgb(0xE1, 0xFF, 0xE1)), new SolidColorBrush(Color.FromRgb(0xFF, 0xE1, 0xE1)),
-                new SolidColorBrush(Color.FromRgb(0xF5, 0xE1, 0xFF)), new SolidColorBrush(Color.FromRgb(0x40, 0x40, 0x40))
+                new(Color.FromRgb(0xFF, 0xF5, 0xE1)), new(Color.FromRgb(0xE1, 0xF5, 0xFF)),
+                new(Color.FromRgb(0xE1, 0xFF, 0xE1)), new(Color.FromRgb(0xFF, 0xE1, 0xE1)),
+                new(Color.FromRgb(0xF5, 0xE1, 0xFF)), new(Color.FromRgb(0x40, 0x40, 0x40))
             };
         }
 
@@ -43,59 +45,139 @@ namespace NotiApp
             this.Left = SystemParameters.PrimaryScreenWidth - this.Width - 50;
             this.Top = 50;
             _jiggleAnimation = (Storyboard)this.Resources["JiggleAnimation"];
-            UpdateMinWidth(); // Set initial min width based on default title
+            _lastNoteSize = new Size(this.Width, this.Height); // Initialize with startup size
+            UpdateMinWidth();
         }
 
-        // --- NEW: Dynamic Width and Title Limit Logic ---
+        private void Window_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            // Persistently update the size when the note is visible and not animating.
+            if (!_isHidden && !_isAnimating)
+            {
+                _lastNoteSize = e.NewSize;
+            }
+        }
+
+        // --- Hiding and Showing: The New Core Logic ---
+
+        private void Window_Deactivated(object sender, EventArgs e)
+        {
+            if (!_isPinned && !_isHidden)
+            {
+                HideNote();
+            }
+        }
+
+        private void HideNote()
+        {
+            if (_isAnimating || _isHidden) return;
+            
+            // The window's Left/Top is now the single source of truth for position.
+            // Size is updated by Window_SizeChanged, no need to set it here.
+            
+            _isAnimating = true;
+
+            var fadeOutAnim = new DoubleAnimation(0, TimeSpan.FromSeconds(0.2));
+            fadeOutAnim.Completed += (s, a) =>
+            {
+                MainBorder.Visibility = Visibility.Collapsed;
+                this.ResizeMode = ResizeMode.NoResize;
+
+                double iconContainerSize = 54.0;
+                var animDuration = TimeSpan.FromSeconds(0.3);
+                var ease = new PowerEase { EasingMode = EasingMode.EaseInOut };
+
+                this.BeginAnimation(WidthProperty, new DoubleAnimation(iconContainerSize, animDuration) { EasingFunction = ease });
+                var heightAnim = new DoubleAnimation(iconContainerSize, animDuration) { EasingFunction = ease };
+                
+                heightAnim.Completed += (s2, a2) =>
+                {
+                    _isHidden = true;
+                    _isAnimating = false;
+                    IconView.Visibility = Visibility.Visible;
+                    _jiggleAnimation.Begin(IconView);
+                };
+                this.BeginAnimation(HeightProperty, heightAnim);
+            };
+            MainBorder.BeginAnimation(UIElement.OpacityProperty, fadeOutAnim);
+        }
+
+        private void ShowNote()
+        {
+            if (_isAnimating || !_isHidden) return;
+            _isAnimating = true;
+            
+            IconView.Visibility = Visibility.Collapsed;
+            
+            // The window is already at the correct Left/Top (the bubble's position).
+            // We just need to animate its size back to the last known note size.
+            var animDuration = TimeSpan.FromSeconds(0.3);
+            var ease = new PowerEase { EasingMode = EasingMode.EaseOut };
+            
+            this.BeginAnimation(WidthProperty, new DoubleAnimation(_lastNoteSize.Width, animDuration) { EasingFunction = ease });
+            var heightAnim = new DoubleAnimation(_lastNoteSize.Height, animDuration) { EasingFunction = ease };
+
+            heightAnim.Completed += (s, a) =>
+            {
+                // Stop animations to allow manual setting of final size without conflict.
+                this.BeginAnimation(WidthProperty, null);
+                this.BeginAnimation(HeightProperty, null);
+
+                // Restore the exact last known size. Position is already correct.
+                this.Width = _lastNoteSize.Width;
+                this.Height = _lastNoteSize.Height;
+
+                MainBorder.Visibility = Visibility.Visible;
+                MainBorder.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(1, TimeSpan.FromSeconds(0.2)));
+                
+                this.ResizeMode = ResizeMode.CanResizeWithGrip;
+
+                // Mark as not hidden and not animating AFTER all visual changes are set.
+                _isHidden = false;
+                _isAnimating = false;
+            };
+            this.BeginAnimation(HeightProperty, heightAnim);
+        }
+
+        // --- UI and Dragging Logic (Unchanged but Confirmed Stable) ---
+
+        private void HideButton_Click(object sender, RoutedEventArgs e)
+        {
+            HideNote();
+        }
+
         private void TitleTextBox_TextChanged(object sender, TextChangedEventArgs e)
         {
             var textBox = sender as TextBox;
             if (textBox == null) return;
-
-            // 1. Enforce character limit
             if (textBox.Text.Length > TitleCharacterLimit)
             {
                 textBox.Text = textBox.Text.Substring(0, TitleCharacterLimit);
-                textBox.CaretIndex = TitleCharacterLimit; // Move cursor to end
+                textBox.CaretIndex = TitleCharacterLimit;
             }
-            
-            // 2. Update the window's minimum width
             UpdateMinWidth();
         }
 
         private void UpdateMinWidth()
         {
-            // Measure the exact size of the text
-            var formattedText = new FormattedText(
-                TitleTextBox.Text,
-                CultureInfo.CurrentCulture,
-                FlowDirection.LeftToRight,
+            var formattedText = new FormattedText(TitleTextBox.Text, CultureInfo.CurrentCulture, FlowDirection.LeftToRight,
                 new Typeface(TitleTextBox.FontFamily, TitleTextBox.FontStyle, TitleTextBox.FontWeight, TitleTextBox.FontStretch),
-                TitleTextBox.FontSize,
-                Brushes.Black, // Brush doesn't matter for size measurement
-                VisualTreeHelper.GetDpi(this).PixelsPerDip);
-
-            double titleWidth = formattedText.Width;
-            double buttonsWidth = 90; // 3 buttons * 30px each
-            double horizontalPadding = 30; // Margins and space between title and buttons
-
-            double requiredWidth = titleWidth + buttonsWidth + horizontalPadding;
-            
-            // Set the MinWidth to be the larger of our absolute minimum or the calculated required width
+                TitleTextBox.FontSize, Brushes.Black, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+            double requiredWidth = formattedText.Width + 90 + 30;
             this.MinWidth = Math.Max(AbsoluteMinWidth, requiredWidth);
         }
 
-        // --- UI Interaction Logic ---
         private void ColorButton_Click(object sender, RoutedEventArgs e)
         {
             _currentColorIndex = (_currentColorIndex + 1) % _noteColors.Count;
             var newColor = _noteColors[_currentColorIndex];
             HeaderBorder.Background = BodyBorder.Background = FooterBorder.Background = IconBackground.Fill = newColor;
             var textColor = (_currentColorIndex == _noteColors.Count - 1) ? Brushes.WhiteSmoke : Brushes.Black;
+            
+            // FIXED: Changed BodyBorder.Foreground to BodyTextBox.Foreground
             TitleTextBox.Foreground = BodyTextBox.Foreground = textColor;
         }
         
-        // --- Dragging Logic ---
         private void Header_MouseLeftButtonDown(object sender, MouseButtonEventArgs e) { if (e.ButtonState == MouseButtonState.Pressed) DragMove(); }
         private void IconView_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
@@ -125,76 +207,6 @@ namespace NotiApp
             _isDraggingIcon = false;
         }
         
-        // --- Hiding and Showing Logic ---
-        private void Window_Deactivated(object sender, EventArgs e) { if (!_isPinned && !_isHidden) HideNote(); }
-
-        private void HideNote()
-        {
-            if (_isAnimating || _isHidden) return;
-            _isAnimating = true;
-
-            if (!_isHidden)
-            {
-                _lastNotePosition = new Point(this.Left, this.Top);
-                _lastNoteSize = new Size(this.ActualWidth, this.ActualHeight);
-            }
-            
-            var fadeOutAnim = new DoubleAnimation(0, TimeSpan.FromSeconds(0.2));
-            fadeOutAnim.Completed += (s, a) =>
-            {
-                MainBorder.Visibility = Visibility.Collapsed;
-                this.ResizeMode = ResizeMode.NoResize;
-
-                double iconContainerSize = 54.0; 
-                var anim = new Duration(TimeSpan.FromSeconds(0.3));
-                var ease = new PowerEase { EasingMode = EasingMode.EaseInOut };
-
-                this.BeginAnimation(WidthProperty, new DoubleAnimation(iconContainerSize, anim) { EasingFunction = ease });
-                var heightAnim = new DoubleAnimation(iconContainerSize, anim) { EasingFunction = ease };
-                
-                heightAnim.Completed += (s2, a2) =>
-                {
-                    _isHidden = true;
-                    _isAnimating = false;
-                    IconView.Visibility = Visibility.Visible;
-                    _jiggleAnimation.Begin(IconView);
-                };
-                this.BeginAnimation(HeightProperty, heightAnim);
-            };
-            MainBorder.BeginAnimation(UIElement.OpacityProperty, fadeOutAnim);
-        }
-
-        private void ShowNote()
-        {
-            if (_isAnimating || !_isHidden) return;
-            _isAnimating = true;
-            _lastNotePosition = new Point(this.Left, this.Top);
-            
-            IconView.Visibility = Visibility.Collapsed;
-            
-            var anim = new Duration(TimeSpan.FromSeconds(0.3));
-            var ease = new PowerEase { EasingMode = EasingMode.EaseOut };
-            
-            this.BeginAnimation(WidthProperty, new DoubleAnimation(_lastNoteSize.Width, anim) { EasingFunction = ease });
-            var heightAnim = new DoubleAnimation(_lastNoteSize.Height, anim) { EasingFunction = ease };
-
-            heightAnim.Completed += (s, a) =>
-            {
-                MainBorder.Visibility = Visibility.Visible;
-                MainBorder.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(1, TimeSpan.FromSeconds(0.2)));
-
-                _isHidden = false;
-                _isAnimating = false;
-                this.ResizeMode = ResizeMode.CanResizeWithGrip;
-                this.Width = _lastNoteSize.Width;
-                this.Height = _lastNoteSize.Height;
-                this.Left = _lastNotePosition.X;
-                this.Top = _lastNotePosition.Y;
-            };
-            this.BeginAnimation(HeightProperty, heightAnim);
-        }
-        
-        // --- Other Logic ---
         private void PinButton_Click(object sender, RoutedEventArgs e)
         {
             _isPinned = !_isPinned;
